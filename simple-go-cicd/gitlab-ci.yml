@@ -1,0 +1,118 @@
+stages:
+  - check
+  - test
+  - build
+  - image
+  - deploy
+
+variables:
+  GO_VERSION: "1.26"
+  DOCKER_TLS_CERTDIR: "/certs"
+
+.go_job:
+  image: golang:${GO_VERSION}-alpine
+  before_script:
+    - go version
+
+format:
+  extends: .go_job
+  stage: check
+  script:
+    - |
+      UNFORMATTED="$(gofmt -l .)"
+      if [ -n "$UNFORMATTED" ]; then
+        echo "These files must be formatted:"
+        echo "$UNFORMATTED"
+        exit 1
+      fi
+
+vet:
+  extends: .go_job
+  stage: check
+  script:
+    - go vet ./...
+
+test:
+  extends: .go_job
+  stage: test
+  script:
+    - go test -race -coverprofile=coverage.out ./...
+    - go tool cover -func=coverage.out
+  artifacts:
+    when: always
+    paths:
+      - coverage.out
+    expire_in: 7 days
+
+build:
+  extends: .go_job
+  stage: build
+  script:
+    - mkdir -p bin
+    - CGO_ENABLED=0 GOOS=linux go build -o bin/app ./cmd/app
+  artifacts:
+    paths:
+      - bin/app
+    expire_in: 7 days
+
+docker-image:
+  stage: image
+  image: docker:29-cli
+  services:
+    - name: docker:29-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" |
+      docker login
+      --username "$CI_REGISTRY_USER"
+      --password-stdin
+      "$CI_REGISTRY"
+  script:
+    - docker build --pull -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+
+    - docker tag
+      "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+      "$CI_REGISTRY_IMAGE:latest"
+
+    - docker push "$CI_REGISTRY_IMAGE:latest"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+deploy-production:
+  stage: deploy
+  image: alpine:3.23
+  environment:
+    name: production
+    url: http://$DEPLOY_HOST:8080
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval "$(ssh-agent -s)"
+    - chmod 400 "$SSH_PRIVATE_KEY"
+    - ssh-add "$SSH_PRIVATE_KEY"
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - cp "$SSH_KNOWN_HOSTS" ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_HOST" "
+        echo '$CI_REGISTRY_PASSWORD' |
+          docker login \
+            --username '$CI_REGISTRY_USER' \
+            --password-stdin \
+            '$CI_REGISTRY' &&
+
+        docker pull '$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA' &&
+
+        docker rm -f simple-go-app 2>/dev/null || true &&
+
+        docker run \
+          --detach \
+          --name simple-go-app \
+          --restart unless-stopped \
+          --publish 8080:8080 \
+          '$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA'
+      "
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
