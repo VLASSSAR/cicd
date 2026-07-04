@@ -10,7 +10,7 @@ COPY go.mod ./
 RUN go mod download
 
 # Копирует весь проект из build context в текущую директорию контейнера.
-COPY . .
+COPY cicd .
 
 RUN CGO_ENABLED=0 GOOS=linux \
     go build \
